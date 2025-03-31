@@ -57,14 +57,107 @@ class MLPMapper(nn.Module):
             
         return logits
 
-class ResNet50(nn.Module):
-    def __init__(self):
-        super(ResNet50, self).__init__()
-        self.encoder = models.resnet50(weights=None)  # Do not load pretrained weights
-        self.encoder.conv1 = nn.Conv2d(3, 64, 3, 1, 1, bias=False)
+class SimpleCNN(nn.Module):
+    """
+    A deeper CNN architecture with skip connections. 
+    We define three "blocks":
+      - Block1: 1->16->16 channels + skip, then pool
+      - Block2: 16->16->16 channels + skip, then pool
+      - Block3: 16->32->32 channels + skip (no pool at end)
+    Finally, we flatten and use 2 fully connected layers.
+    """
+    def __init__(self, output_dim=2, softmax = False, normalize_feats=False, unit_sphere=False):
+        super().__init__()
+        
+        # ----- Block 1 (1 -> 16 -> 16) -----
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=3, padding=1)
+
+        # ----- Block 2 (16 -> 16 -> 16) -----
+        self.conv3 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=3, padding=1)
+
+        # ----- Block 3 (16 -> 32 -> 32) -----
+        self.conv5 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
+        self.conv6 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
+
+        # ----- Fully connected layers -----
+        self.fc1 = nn.Linear(32 * 7 * 7, 128)
+        self.fc2 = nn.Linear(128, output_dim)
+        self.output_dim = output_dim
+        self.softmax = softmax
+        self.normalize_feats = normalize_feats
+        self.unit_sphere = unit_sphere
+
+    def forward(self, x):
+        # x shape: [batch, 1, 28, 28]
+
+        # ----- Block 1 -----
+        # conv1 + relu
+        x = x.view(-1, 1, 28, 28)
+        out1 = F.relu(self.conv1(x))  
+        # conv2 (skip from out1)
+        out2 = self.conv2(out1)        
+        out2 = F.relu(out2 + out1)     # skip connection
+        out2 = F.max_pool2d(out2, 2)   # [batch, 16, 14, 14]
+
+        # ----- Block 2 -----
+        out3 = F.relu(self.conv3(out2))
+        out4 = self.conv4(out3)
+        out4 = F.relu(out4 + out3)     # skip connection
+        out4 = F.max_pool2d(out4, 2)   # [batch, 16, 7, 7]
+
+        # ----- Block 3 -----
+        out5 = F.relu(self.conv5(out4)) 
+        out6 = self.conv6(out5)
+        out6 = F.relu(out6 + out5)     # skip connection
+        # shape is now [batch, 32, 7, 7]
+
+        # Flatten
+        out6 = out6.view(-1, 32 * 7 * 7)
+
+        # Fully connected layers
+        out6 = F.relu(self.fc1(out6))
+        out6 = self.fc2(out6)
+        if self.softmax:
+            out6 = F.softmax(out6)
+        if self.normalize_feats:
+            # Normalize final output (Feature-wise standardization: Mean 0, Std 1)
+            mean = out6.mean(dim=0, keepdim=True)
+            std = out6.std(dim=0, keepdim=True) + 1e-5  
+            out6 = (out6 - mean) 
+            if std.min().item() > 1:
+                out6 = out6 / std
+        if self.unit_sphere:
+            out6 = F.normalize(out6, p=2, dim=1)
+        return out6
+
+class ResNet(nn.Module):
+    def __init__(self, model_type="resnet50"):
+        """
+        Initialize a ResNet model.
+        
+        Args:
+            model_type (str): Type of ResNet model to use. Options: "resnet18", "resnet34", "resnet50".
+        """
+        super(ResNet, self).__init__()
+        
+        # Choose the ResNet model based on the specified type
+        if model_type == "resnet18":
+            self.encoder = models.resnet18(weights=None)  # Do not load pretrained weights
+            self.output_dim = 512
+        elif model_type == "resnet34":
+            self.encoder = models.resnet34(weights=None)
+            self.output_dim = 512
+        elif model_type == "resnet50":
+            self.encoder = models.resnet50(weights=None)
+            self.output_dim = 2048
+        else:
+            raise ValueError(f"Unsupported model_type: {model_type}. Use 'resnet18', 'resnet34', or 'resnet50'.")
+        
+        self.encoder.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.encoder.maxpool = nn.Identity()
-        self.encoder.fc = nn.Identity()  
-        self.output_dim = 2048
+        self.encoder.fc = nn.Identity()
     
     def forward(self, x):
         return self.encoder(x)
@@ -252,3 +345,11 @@ class KNNMapper(nn.Module, NonParametricMapper):
         """Update reference points."""
         if self.training and self.reference_points is None:
             self.reference_points = F.normalize(x.detach().clone(), dim=1)
+            
+class OneHotEncoder(nn.Module):
+    def __init__(self, num_classes):
+        super(OneHotEncoder, self).__init__()
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        return F.one_hot(x, num_classes=self.num_classes).float()

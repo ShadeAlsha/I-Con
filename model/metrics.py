@@ -79,6 +79,24 @@ class UnsupervisedAccuracy(Metric):
                 "No cluster-to-class mapping available. Please call compute() first."
             )
         return self.cluster_to_class_map[clusters]
+    def map_classes_to_clusters(self, class_labels: torch.Tensor):
+        """
+        Map class labels to clusters using the reverse class-to-cluster mapping.
+        """
+        if self.cluster_to_class_map is None:
+            raise ValueError(
+                "No cluster-to-class mapping available. Please call compute() first."
+            )
+        
+        # Create reverse mapping
+        class_to_cluster_map = {v: k for k, v in enumerate(self.cluster_to_class_map)}
+        
+        # Map the given class labels to clusters
+        mapped_clusters = torch.tensor(
+            [class_to_cluster_map[label.item()] for label in class_labels],
+            dtype=torch.long,
+        )
+        return mapped_clusters
 
     def get_confusion_matrix(self):
         """
@@ -105,3 +123,42 @@ if __name__ == "__main__":
     assert int(result) == 80
 
     print("Test passed!")
+
+class Accuracy(Metric):
+    def __init__(self, num_classes: int, ignore_index: int = -1, **kwargs):
+        """
+        Computes accuracy while ignoring samples with the specified label (`ignore_index`).
+
+        Args:
+            num_classes (int): The number of classes.
+            ignore_index (int): The label to ignore (default: -1).
+            **kwargs: Additional keyword arguments passed to the Metric base class.
+        """
+        super().__init__(**kwargs)
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.add_state("correct", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor):
+        """
+        Update the state with predictions and targets.
+
+        Args:
+            preds (torch.Tensor): Predicted class indices (shape: [batch_size]).
+            target (torch.Tensor): Ground truth labels (shape: [batch_size]).
+        """
+        # Ensure predictions and targets are on the same device
+        preds, target = preds.to(self.correct.device), target.to(self.correct.device)
+
+        # Mask to ignore `ignore_index` labels
+        valid_mask = target != self.ignore_index
+        preds, target = preds[valid_mask], target[valid_mask]
+
+        # Compute the number of correct predictions
+        self.correct += (preds == target).sum()
+        self.total += valid_mask.sum()
+
+    def compute(self):
+        """Compute the final accuracy."""
+        return self.correct.float() / self.total if self.total > 0 else torch.tensor(0.0, device=self.correct.device)

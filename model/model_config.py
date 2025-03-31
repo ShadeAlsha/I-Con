@@ -13,14 +13,16 @@ class KernelModelConfig:
     num_classes: Optional[int] = None
     embeddings_map: Optional[nn.Module] = None
     embeddings_map2: Optional[nn.Module] = None
-    lr: float = 1e-3
+    lr: float = 5e-4
     accuracy_mode: Optional[str] = None
     use_ema: bool = False
     ema_momentum: float = 0.999
-    loss_type: str = 'kl'
+    loss_type: str = 'ce'
     decay_factor: float = 0.9
     linear_probe: bool = False
-    gradient_clip_val: float = 1.0
+    optimizer: str = 'adamw'
+    weight_decay: float = 0.0
+    gradient_clip_val: float = 10.0
     use_mixed_precision: bool = True
     log_kernel_loss:bool = True
     
