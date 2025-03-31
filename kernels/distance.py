@@ -3,18 +3,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, List, Optional, Tuple
-from .base import Kernel, KernelConfig
+from .base import Kernel
+from .utils import fill_diagonal
 
 class DistanceKernel(Kernel):
     """Enhanced distance computation kernel with optimizations."""
-    
     VALID_METRICS = {'euclidean', 'cosine', 'dot', 'manhattan', 'minkowski'}
     
-    def __init__(self, metric: str = 'euclidean', config: Optional[KernelConfig] = None):
-        super().__init__(config)
-        if metric not in self.VALID_METRICS:
-            raise ValueError(f"Metric must be one of {self.VALID_METRICS}")
+    def __init__(self, metric: str = 'euclidean', p=2, mapper=None):
+        super().__init__()
         self.metric = metric
+        self.p = p
+        if mapper is not None:
+            self.mapper = mapper
+        else:
+            self.mapper = lambda x: x
             
     def forward(self, features: Union[torch.Tensor, List[torch.Tensor]], 
                 labels: Optional[torch.Tensor] = None,
@@ -26,9 +29,9 @@ class DistanceKernel(Kernel):
         else:
             x1 = x2 = features
             
-        #x1 = x1.to(device=self.config.device, dtype=self.config.dtype)
-        #x2 = x2.to(device=self.config.device, dtype=self.config.dtype)
-            
+        x1 = self.mapper(x1)
+        x2 = self.mapper(x2)
+        
         # Compute distances based on metric
         if self.metric == 'euclidean':
             return self._euclidean_distance(x1, x2)
@@ -50,8 +53,8 @@ class DistanceKernel(Kernel):
 
     def _cosine_distance(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Optimized cosine distance computation."""
-        x1_normalized = F.normalize(x1, p=2, dim=1)
-        x2_normalized = F.normalize(x2, p=2, dim=1)
+        x1_normalized = F.normalize(x1, p=self.p, dim=1)
+        x2_normalized = F.normalize(x2, p=self.p, dim=1)
         return 1 - torch.mm(x1_normalized, x2_normalized.t())
 
     @staticmethod
@@ -63,100 +66,38 @@ class DistanceKernel(Kernel):
         """Compute Manhattan (L1) distance."""
         return torch.cdist(x1, x2, p=1)
 
-    def _minkowski_distance(self, x1: torch.Tensor, x2: torch.Tensor, p: float = 3) -> torch.Tensor:
+    def _minkowski_distance(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Compute Minkowski distance."""
-        return torch.cdist(x1, x2, p=p)
+        return torch.cdist(x1, x2, p=self.p)
 
 class GaussianKernel(Kernel):
-    """Enhanced Gaussian/RBF kernel with adaptive bandwidth selection."""
-    
-    def __init__(
-        self,
-        sigma: Optional[float] = None,
-        perplexity: float = 30.0,
-        metric: str = 'euclidean',
-        config: Optional[KernelConfig] = None
-    ):
-        super().__init__(config)
+    def __init__(self, 
+                 metric: str = 'euclidean',
+                 sigma: Optional[float] = None, 
+                 perplexity: Optional[float] = None,
+                 mapper=None,
+                 **kwargs):
+        super().__init__(**kwargs)
         self.sigma = sigma
         self.perplexity = perplexity
-        self.distance_kernel = DistanceKernel(metric=metric, config=config)
-        self._init_bandwidth_estimator()
-
-    def _init_bandwidth_estimator(self):
-        """Initialize the bandwidth estimator."""
-        self.bandwidth_estimator = AdaptiveBandwidthEstimator(
-            perplexity=self.perplexity,
-            tolerance=1e-5,
-            max_iter=50,
-            device=self.config.device
-        )
-
-    def forward(self, features: Union[torch.Tensor, List[torch.Tensor]], 
+        self.distance_kernel = DistanceKernel(metric=metric, mapper=mapper)
+        
+    def forward(self, 
+                features: Union[torch.Tensor, List[torch.Tensor]], 
                 labels: Optional[torch.Tensor] = None,
                 idx: Optional[torch.Tensor] = None,
                 return_log: bool = False) -> torch.Tensor:
-        """Compute Gaussian kernel with automatic bandwidth selection."""
         distances = self.distance_kernel(features)
-        
-        if self.config.mask_diagonal:
+        if self.mask_diagonal:
             distances = fill_diagonal(distances,float('inf'))
             
-        if self.sigma is None:
-            sigma = self.bandwidth_estimator(distances)
-        else:
-            sigma = torch.full((distances.size(0),), self.sigma, device=distances.device)
-        
-        logits = -distances / (2 * sigma.view(-1, 1) ** 2)
+        logits = -distances / (2 * self.sigma ** 2)
         
         if return_log:
             affinities = F.log_softmax(logits, dim=1)
         else:
             affinities = F.softmax(logits, dim=1)
-                
         return affinities
-
-class AdaptiveBandwidthEstimator:
-    """Improved bandwidth estimation using binary search with early stopping."""
-    
-    def __init__(self, perplexity: float, tolerance: float = 1e-5,
-                 max_iter: int = 50, device: str = 'cuda'):
-        self.perplexity = perplexity
-        self.tolerance = tolerance
-        self.max_iter = max_iter
-        self.device = device
-        self.target_entropy = torch.log(torch.tensor(perplexity, device=device))
-
-    @torch.no_grad()
-    def __call__(self, distances: torch.Tensor) -> torch.Tensor:
-        """Estimate optimal bandwidths for each point."""
-        n = distances.size(0)
-        sigma = torch.ones(n, device=self.device)
-        
-        # Initialize bounds
-        lower = torch.full_like(sigma, 1e-10)
-        upper = torch.full_like(sigma, 1e10)
-        
-        # Binary search with early stopping
-        for _ in range(self.max_iter):
-            # Compute probabilities and entropy
-            P = self._compute_gaussian_probs(distances, sigma)
-            entropy = -torch.sum(P * torch.log(P + 1e-7), dim=1)
-            
-            # Check convergence
-            error = torch.abs(entropy - self.target_entropy)
-            if torch.all(error < self.tolerance):
-                break
-                
-            # Update bounds
-            mask_low = entropy < self.target_entropy
-            mask_high = entropy > self.target_entropy
-            
-            lower[mask_low] = sigma[mask_low]
-            upper[mask_high] = sigma[mask_high]
-            sigma = torch.sqrt(lower * upper)
-            
-        return sigma
 
     def _compute_gaussian_probs(self, distances: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         """Compute Gaussian probabilities efficiently."""
@@ -169,19 +110,32 @@ class AdaptiveBandwidthEstimator:
         
         return exp_logits / exp_sum
 
-class CauchyKernel(Kernel):
-    """Implements heavy-tailed Cauchy kernel, suitable for low-dimensional embeddings."""
-    
+class StudentTKernel(Kernel):
+    """
+    Implements the Student-t kernel with an option to make gamma learnable.
+    """
     def __init__(
-        self,
-        gamma: float = 1.0,
-        metric: str = 'euclidean',
-        config: Optional[KernelConfig] = None
-    ):
-        super().__init__(config)
-        self.gamma = gamma
-        self.distance_kernel = DistanceKernel(metric=metric, config=config)
-    
+            self,
+            gamma: float = 1.0,
+            df: float = 1.0,  # degrees of freedom
+            learnable_gamma: bool = False,  # Option to learn gamma
+            metric: str = 'euclidean',
+            **kwargs):
+        super().__init__(**kwargs)
+        
+        self.learnable_gamma = learnable_gamma  # Store flag
+        
+        if self.learnable_gamma:
+            # Register gamma as a learnable parameter
+            self.gamma = nn.Parameter(torch.tensor(float(gamma), dtype=torch.float32))
+        else:
+            # Store gamma as a constant buffer (moved with model but not trained)
+            self.register_buffer("gamma", torch.tensor(float(gamma), dtype=torch.float32))
+        
+        # Store df as a fixed value
+        self.df = df  
+        self.distance_kernel = DistanceKernel(metric=metric)
+        
     def forward(
         self,
         features: Union[torch.Tensor, List[torch.Tensor]],
@@ -189,27 +143,34 @@ class CauchyKernel(Kernel):
         idx: Optional[torch.Tensor] = None,
         return_log: bool = False
     ) -> torch.Tensor:
+        # Compute pairwise distances
         distances = self.distance_kernel(features)
-        
-        if self.config.mask_diagonal:
-            distances = fill_diagonal(distances,float('inf'))
+
+        # Mask diagonal if configured
+        if self.mask_diagonal:
+            distances = fill_diagonal(distances, float('inf'))
             
-        affinities = 1 / (1 + (distances / self.gamma) ** 2)
-        
-        if self.config.normalize:
+        # Compute kernel values
+        squared_distances = distances ** 2
+
+
+        if return_log:
+            log_term = (self.df / 2) * (torch.log(squared_distances+1e-8)- 2*torch.log(self.gamma))
+            log_denominator = torch.log1p(torch.exp(log_term))
+            affinities = -log_denominator
+        else:
+            affinities = 1 / (1 + (squared_distances / self.gamma**2 ) ** (self.df / 2))
+            
+        # Normalize if configured
+        if self.normalize:
             if return_log:
-                #affinities = torch.log(affinities) - torch.logsumexp(torch.log(affinities), dim=1, keepdim=True)
-                affinities = torch.log(affinities) - torch.sum(affinities, dim=1, keepdim=True)
+                affinities = affinities - torch.logsumexp(affinities, dim=1, keepdim=True)
             else:
                 affinities = F.normalize(affinities, p=1, dim=1)
-                
-        if self.config.symmetric and not return_log:
-            affinities = (affinities + affinities.t()) / 2
             
         return affinities
 
-def fill_diagonal(tensor, value):
-    result = tensor.clone()  # Clone the tensor to avoid modifying the original
-    idx = torch.arange(tensor.size(0))
-    result[idx, idx] = value
-    return result
+    def extra_repr(self) -> str:
+        """Return a string with kernel parameters for printing"""
+        gamma_val = self.gamma.item() if self.learnable_gamma else self.gamma
+        return f'gamma={gamma_val}, df={self.df}, learnable_gamma={self.learnable_gamma}'
