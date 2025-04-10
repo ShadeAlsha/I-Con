@@ -54,7 +54,7 @@ cd ../logs/evaluate
 tensorboard --logdir .
 ```
 
-Then visit [https://localhost:6006](https://localhost:6006) and click on hparams to browse results. We report "advanced" speech metrics and "basic" sound metrics in our paper.
+Then visit [https://localhost:6006](https://localhost:6006) and click on hparams to browse results.
 
 
 ## Train a Model
